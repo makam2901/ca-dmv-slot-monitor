@@ -257,6 +257,11 @@ def submit_make_appointment(driver: webdriver.Chrome) -> None:
     btn.click()
 
 
+def _xpath_literal_single_quoted(s: str) -> str:
+    """XPath 1.0 string in single quotes; escape ' as ''."""
+    return "'" + s.replace("'", "''") + "'"
+
+
 def optional_zip_search(driver: webdriver.Chrome) -> None:
     z = os.getenv("DMV_ZIP_CODE", "").strip()
     if not z:
@@ -284,6 +289,45 @@ def optional_zip_search(driver: webdriver.Chrome) -> None:
             except NoSuchElementException:
                 continue
         return
+
+
+def optional_select_office(driver: webdriver.Chrome) -> None:
+    """If DMV_OFFICE_CLICK_TEXT is set, click the first visible control whose text contains it (e.g. Santa Clara)."""
+    label = os.getenv("DMV_OFFICE_CLICK_TEXT", "").strip()
+    if not label:
+        return
+    time.sleep(float(os.getenv("OFFICE_LIST_PAUSE", "1.0")))
+    lit = _xpath_literal_single_quoted(label.lower())
+    # Case-insensitive match on normalized text
+    contains_ci = (
+        f"contains(translate(normalize-space(.), "
+        f"'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), {lit})"
+    )
+    xpaths = [
+        f"//a[{contains_ci}]",
+        f"//button[{contains_ci}]",
+        f"//*[@role='button' and {contains_ci}]",
+        f"//tr[{contains_ci}]//*[self::a or self::button][1]",
+        f"//li[{contains_ci}]//*[self::a or self::button][1]",
+    ]
+    for xp in xpaths:
+        try:
+            els = driver.find_elements(By.XPATH, xp)
+        except WebDriverException:
+            continue
+        for el in els:
+            try:
+                if el.is_displayed() and el.is_enabled():
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});", el
+                    )
+                    el.click()
+                    time.sleep(
+                        float(os.getenv("POST_OFFICE_CLICK_PAUSE", "1.5"))
+                    )
+                    return
+            except StaleElementReferenceException:
+                continue
 
 
 def page_body_text(driver: webdriver.Chrome) -> str:
@@ -371,6 +415,7 @@ def run_flow(driver: webdriver.Chrome) -> None:
     time.sleep(float(os.getenv("POST_NAV_PAUSE", "2.0")))
     optional_zip_search(driver)
     time.sleep(float(os.getenv("POST_ZIP_PAUSE", "1.5")))
+    optional_select_office(driver)
 
 
 def recover_session(driver_holder: list[webdriver.Chrome | None]) -> webdriver.Chrome:

@@ -1,0 +1,27 @@
+CA DMV appointment slot monitor
+================================
+
+1) Run ./setup_chrome.sh once (installs deps into .venv, creates .env).
+
+2) Edit .env:
+   - DMV_DL_NUMBER, DMV_DOB (required after you pick APPOINTMENT_CATEGORY).
+   - SMTP_* and ALERT_EMAIL_* for Gmail or your provider.
+   - Optional: DMV_ZIP_CODE if a later step asks for an office search.
+   - Tune SLOT_CSS_SELECTORS after you inspect the time-slot page in Chrome DevTools
+     (comma-separated CSS selectors for visible time buttons). This is the most reliable signal.
+
+3) Foreground:  source .venv/bin/activate && python monitor.py
+
+4) Always-on (macOS): edit com.local.dmv-slot-monitor.plist — replace YOUR_USERNAME
+   with your macOS short username, then:
+     cp com.local.dmv-slot-monitor.plist ~/Library/LaunchAgents/
+     launchctl load ~/Library/LaunchAgents/com.local.dmv-slot-monitor.plist
+
+   Logs: monitor.log in this directory.
+
+Notes
+-----
+- Selenium 4 downloads a ChromeDriver build compatible with your installed Chrome.
+- On session timeouts or driver errors the script tears down Chrome and starts a fresh session,
+  then reloads START_URL and runs the flow again.
+- Automated access may conflict with the DMV site terms of use; use at your own discretion.

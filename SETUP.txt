@@ -10,7 +10,13 @@ CA DMV appointment slot monitor
    - Tune SLOT_CSS_SELECTORS after you inspect the time-slot page in Chrome DevTools
      (comma-separated CSS selectors for visible time buttons). This is the most reliable signal.
 
-3) Foreground:  source .venv/bin/activate && python monitor.py
+3) Foreground (run these as separate lines; do not paste comment text into zsh):
+
+     source .venv/bin/activate
+     python monitor.py
+
+   zsh treats * as a glob: a line like SMTP_* in the shell will error with
+   "no matches found". Use only real commands, or quote: echo 'SMTP_*'
 
 4) Always-on (macOS): edit com.local.dmv-slot-monitor.plist — replace YOUR_USERNAME
    with your macOS short username, then:

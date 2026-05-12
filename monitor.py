@@ -381,8 +381,24 @@ def recover_session(driver_holder: list[webdriver.Chrome | None]) -> webdriver.C
     return d
 
 
+def validate_required_env() -> None:
+    """Exit early with a clear message instead of opening Chrome in a restart loop."""
+    missing = []
+    if not os.getenv("DMV_DL_NUMBER", "").strip():
+        missing.append("DMV_DL_NUMBER")
+    if not os.getenv("DMV_DOB", "").strip():
+        missing.append("DMV_DOB")
+    if missing:
+        LOG.error(
+            "Missing required .env values: %s. Copy env.example to .env and set them.",
+            ", ".join(missing),
+        )
+        sys.exit(2)
+
+
 def main() -> None:
     _setup_logging()
+    validate_required_env()
     poll = _env_int("POLL_INTERVAL_SECONDS", 120)
     driver_box: list[webdriver.Chrome | None] = [None]
 

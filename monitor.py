@@ -17,6 +17,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
+from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -372,6 +373,18 @@ def time_pattern_suggest_slots(body: str) -> bool:
 _RE_TIME_HM = re.compile(r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b", re.I)
 _RE_TIME_H = re.compile(r"\b(\d{1,2})\s*(am|pm)\b", re.I)
 
+_RE_DATE_ISO = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_RE_DATE_US = re.compile(r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b")
+_RE_DATE_MON = re.compile(
+    r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2}),?\s+(\d{4})\b",
+    re.I,
+)
+_RE_DATE_LONG = re.compile(
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+"
+    r"(\d{1,2}),?\s+(\d{4})\b",
+    re.I,
+)
+
 
 def _clock_to_minutes(hour12: int, minute: int, ampm: str) -> int:
     ap = ampm.lower()
@@ -422,7 +435,7 @@ def page_body_text_raw(driver: webdriver.Chrome) -> str:
         return ""
 
 
-def gather_text_for_time_parsing(driver: webdriver.Chrome) -> str:
+def gather_slot_parsing_text(driver: webdriver.Chrome) -> str:
     parts = [page_body_text_raw(driver)]
     raw = os.getenv("SLOT_CSS_SELECTORS", "").strip()
     if raw:
@@ -442,7 +455,7 @@ def gather_text_for_time_parsing(driver: webdriver.Chrome) -> str:
 
 
 def collect_slot_times_minutes(driver: webdriver.Chrome) -> set[int]:
-    return parse_times_from_text(gather_text_for_time_parsing(driver))
+    return parse_times_from_text(gather_slot_parsing_text(driver))
 
 
 def times_in_target_window(times: set[int]) -> list[int]:
@@ -457,6 +470,99 @@ def times_in_target_window(times: set[int]) -> list[int]:
 
 def slot_times_within_target_window(times: set[int]) -> bool:
     return bool(times_in_target_window(times))
+
+
+def _date_window_for_threshold(threshold: date) -> tuple[date, date]:
+    """Only keep calendar years around the cutoff (drops DOB years like 2000 on the page)."""
+    lo = date(threshold.year - 1, 1, 1)
+    hi = date(threshold.year, 12, 31)
+    return lo, hi
+
+
+def parse_alert_date_before() -> date | None:
+    raw = os.getenv("SLOT_ALERT_IF_DATE_BEFORE", "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        LOG.error(
+            "Invalid SLOT_ALERT_IF_DATE_BEFORE=%r; expected YYYY-MM-DD. Date filter disabled.",
+            raw,
+        )
+        return None
+
+
+def parse_dates_from_text(text: str, threshold: date) -> set[date]:
+    lo, hi = _date_window_for_threshold(threshold)
+    found: set[date] = set()
+
+    for m in _RE_DATE_ISO.finditer(text):
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            dd = date(y, mo, d)
+        except ValueError:
+            continue
+        if lo <= dd <= hi:
+            found.add(dd)
+
+    for m in _RE_DATE_US.finditer(text):
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            dd = date(y, mo, d)
+        except ValueError:
+            continue
+        if lo <= dd <= hi:
+            found.add(dd)
+
+    mon_map = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    for m in _RE_DATE_MON.finditer(text):
+        mon_s = m.group(1)[:3].lower()
+        d, y = int(m.group(2)), int(m.group(3))
+        mo = mon_map.get(mon_s)
+        if not mo:
+            continue
+        try:
+            dd = date(y, mo, d)
+        except ValueError:
+            continue
+        if lo <= dd <= hi:
+            found.add(dd)
+
+    for m in _RE_DATE_LONG.finditer(text):
+        try:
+            dd = datetime.strptime(
+                f"{m.group(1)} {int(m.group(2))}, {m.group(3)}", "%B %d, %Y"
+            ).date()
+        except ValueError:
+            continue
+        if lo <= dd <= hi:
+            found.add(dd)
+
+    return found
+
+
+def collect_slot_dates_for_filter(driver: webdriver.Chrome, threshold: date) -> set[date]:
+    return parse_dates_from_text(gather_slot_parsing_text(driver), threshold)
+
+
+def dates_strictly_before_threshold(
+    driver: webdriver.Chrome, threshold: date
+) -> list[date]:
+    return sorted({d for d in collect_slot_dates_for_filter(driver, threshold) if d < threshold})
 
 
 def slots_likely_available(driver: webdriver.Chrome) -> bool:
@@ -479,28 +585,43 @@ def slots_likely_available(driver: webdriver.Chrome) -> bool:
     if not base:
         return False
 
-    if not _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
-        return True
+    if _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
+        times = collect_slot_times_minutes(driver)
+        if not times:
+            LOG.info(
+                "Local time filter is on but no times could be parsed; not alerting "
+                "(set SLOT_CSS_SELECTORS so slot button text is scanned, or check page copy)."
+            )
+            return False
+        if not slot_times_within_target_window(times):
+            preview = ", ".join(_format_minutes_clock(t) for t in sorted(times)[:24])
+            suffix = " …" if len(times) > 24 else ""
+            LOG.info(
+                "Slots or times on page, but none within target window "
+                "(hour=%s, ±%s min). Parsed: %s%s",
+                _env_int("SLOT_TARGET_HOUR_24", 13),
+                _env_int("SLOT_TARGET_WINDOW_MINUTES", 45),
+                preview,
+                suffix,
+            )
+            return False
 
-    times = collect_slot_times_minutes(driver)
-    if not times:
-        LOG.info(
-            "Local time filter is on but no times could be parsed; not alerting "
-            "(set SLOT_CSS_SELECTORS so slot button text is scanned, or check page copy)."
-        )
-        return False
-    if not slot_times_within_target_window(times):
-        preview = ", ".join(_format_minutes_clock(t) for t in sorted(times)[:24])
-        suffix = " …" if len(times) > 24 else ""
-        LOG.info(
-            "Slots or times on page, but none within target window "
-            "(hour=%s, ±%s min). Parsed: %s%s",
-            _env_int("SLOT_TARGET_HOUR_24", 13),
-            _env_int("SLOT_TARGET_WINDOW_MINUTES", 45),
-            preview,
-            suffix,
-        )
-        return False
+    cutoff = parse_alert_date_before()
+    if cutoff is not None:
+        in_window = collect_slot_dates_for_filter(driver, cutoff)
+        earlier = [d for d in in_window if d < cutoff]
+        if not earlier:
+            preview = ", ".join(str(d) for d in sorted(in_window)[:12])
+            suffix = " …" if len(in_window) > 12 else ""
+            LOG.info(
+                "Date filter: need a parsed appointment date strictly before %s. "
+                "Calendar-range dates seen: %s%s",
+                cutoff,
+                preview or "(none)",
+                suffix,
+            )
+            return False
+
     return True
 
 
@@ -584,11 +705,21 @@ def main() -> None:
                 url = driver.current_url
                 snippet = page_body_text(driver)[:4000]
                 extra = ""
+                cutoff = parse_alert_date_before()
+                if cutoff is not None:
+                    earlier_dates = dates_strictly_before_threshold(driver, cutoff)
+                    if earlier_dates:
+                        extra += (
+                            "\nParsed date(s) strictly before your cutoff "
+                            f"({cutoff}): "
+                            + ", ".join(str(d) for d in earlier_dates)
+                            + "\n"
+                        )
                 if _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
                     matched = times_in_target_window(collect_slot_times_minutes(driver))
                     if matched:
                         ts = ", ".join(_format_minutes_clock(t) for t in matched)
-                        extra = (
+                        extra += (
                             f"\nTimes in your configured window "
                             f"(hour {_env_int('SLOT_TARGET_HOUR_24', 13)}:00 local "
                             f"±{_env_int('SLOT_TARGET_WINDOW_MINUTES', 45)} min): {ts}\n"

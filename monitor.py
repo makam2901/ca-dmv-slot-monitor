@@ -3,11 +3,15 @@
 Poll the CA DMV appointment flow in Chrome, detect when time slots appear, and send email alerts.
 
 Requires: Google Chrome, Python 3.10+, credentials in .env (see env.example).
+
+Duplicate emails for the same slot snapshot are suppressed via a stored fingerprint; there is
+no time-based cooldown. Poll interval defaults to five minutes.
 """
 
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +24,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from email.message import EmailMessage
 from pathlib import Path
+
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from selenium import webdriver
@@ -124,24 +130,72 @@ def send_email_alert(subject: str, body: str) -> None:
     LOG.info("Sent alert email to %s", cfg.mail_to)
 
 
-def _cooldown_path() -> Path:
-    return ROOT / ".last_alert_ts"
+def _fingerprint_store_path() -> Path:
+    return ROOT / ".alerted_slot_fingerprints.json"
 
 
-def within_alert_cooldown() -> bool:
-    minutes = _env_int("ALERT_COOLDOWN_MINUTES", 30)
-    path = _cooldown_path()
+def _normalized_slot_control_texts(driver: webdriver.Chrome) -> str:
+    raw = os.getenv("SLOT_CSS_SELECTORS", "").strip()
+    if not raw:
+        return ""
+    texts: list[str] = []
+    for sel in [s.strip() for s in raw.split(",") if s.strip()]:
+        try:
+            for e in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if e.is_displayed():
+                        t = " ".join(((e.text or "").strip()).split())
+                        if t:
+                            texts.append(t)
+                except StaleElementReferenceException:
+                    continue
+        except WebDriverException:
+            continue
+    return "\n".join(sorted(texts))
+
+
+def compute_slot_alert_fingerprint(driver: webdriver.Chrome) -> str:
+    """Stable hash for the current availability snapshot (same slot → same fingerprint)."""
+    p = urlparse(driver.current_url)
+    url = urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+    cutoff = parse_alert_date_before()
+    dates: list[str] = []
+    if cutoff is not None:
+        dates = sorted({str(d) for d in dates_strictly_before_threshold(driver, cutoff)})
+    times = sorted(
+        _format_minutes_clock(t) for t in sorted(collect_slot_times_minutes(driver))
+    )
+    ctrl = _normalized_slot_control_texts(driver)
+    payload = {"ctrl": ctrl, "dates": dates, "times": times, "url": url}
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def load_alert_fingerprints() -> list[str]:
+    path = _fingerprint_store_path()
     if not path.exists():
-        return False
+        return []
     try:
-        last = float(path.read_text().strip())
-    except ValueError:
-        return False
-    return (time.time() - last) < minutes * 60
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    if isinstance(data, list):
+        return [str(x) for x in data]
+    if isinstance(data, dict) and isinstance(data.get("fingerprints"), list):
+        return [str(x) for x in data["fingerprints"]]
+    return []
 
 
-def mark_alert_sent() -> None:
-    _cooldown_path().write_text(str(time.time()), encoding="utf-8")
+def remember_alert_fingerprint(fp: str) -> None:
+    cap = _env_int("ALERT_SLOT_FINGERPRINT_CAP", 2000)
+    lst = load_alert_fingerprints()
+    if fp in lst:
+        return
+    lst.append(fp)
+    lst = lst[-cap:]
+    _fingerprint_store_path().write_text(
+        json.dumps(lst, indent=0), encoding="utf-8"
+    )
 
 
 def build_chrome_driver() -> webdriver.Chrome:
@@ -685,7 +739,7 @@ def validate_required_env() -> None:
 def main() -> None:
     _setup_logging()
     validate_required_env()
-    poll = _env_int("POLL_INTERVAL_SECONDS", 120)
+    poll = _env_int("POLL_INTERVAL_SECONDS", 300)
     driver_box: list[webdriver.Chrome | None] = [None]
 
     LOG.info("Starting CA DMV slot monitor (poll every %ss).", poll)
@@ -701,40 +755,47 @@ def main() -> None:
             available = slots_likely_available(driver)
             LOG.info("Checked availability: %s", "OPEN" if available else "none")
 
-            if available and not within_alert_cooldown():
-                url = driver.current_url
-                snippet = page_body_text(driver)[:4000]
-                extra = ""
-                cutoff = parse_alert_date_before()
-                if cutoff is not None:
-                    earlier_dates = dates_strictly_before_threshold(driver, cutoff)
-                    if earlier_dates:
-                        extra += (
-                            "\nParsed date(s) strictly before your cutoff "
-                            f"({cutoff}): "
-                            + ", ".join(str(d) for d in earlier_dates)
-                            + "\n"
-                        )
-                if _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
-                    matched = times_in_target_window(collect_slot_times_minutes(driver))
-                    if matched:
-                        ts = ", ".join(_format_minutes_clock(t) for t in matched)
-                        extra += (
-                            f"\nTimes in your configured window "
-                            f"(hour {_env_int('SLOT_TARGET_HOUR_24', 13)}:00 local "
-                            f"±{_env_int('SLOT_TARGET_WINDOW_MINUTES', 45)} min): {ts}\n"
-                        )
-                send_email_alert(
-                    subject="CA DMV: appointment slots may be available",
-                    body=(
-                        "The monitor detected possible open slots.\n\n"
-                        f"URL: {url}\n"
-                        f"{extra}\n"
-                        "Page text excerpt (lowercase):\n"
-                        f"{snippet}\n"
-                    ),
-                )
-                mark_alert_sent()
+            if available:
+                fp = compute_slot_alert_fingerprint(driver)
+                if fp in set(load_alert_fingerprints()):
+                    LOG.info(
+                        "Open slots match a snapshot we already emailed; skipping duplicate."
+                    )
+                else:
+                    url = driver.current_url
+                    snippet = page_body_text(driver)[:4000]
+                    extra = ""
+                    cutoff = parse_alert_date_before()
+                    if cutoff is not None:
+                        earlier_dates = dates_strictly_before_threshold(driver, cutoff)
+                        if earlier_dates:
+                            extra += (
+                                "\nParsed date(s) strictly before your cutoff "
+                                f"({cutoff}): "
+                                + ", ".join(str(d) for d in earlier_dates)
+                                + "\n"
+                            )
+                    if _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
+                        matched = times_in_target_window(collect_slot_times_minutes(driver))
+                        if matched:
+                            ts = ", ".join(_format_minutes_clock(t) for t in matched)
+                            extra += (
+                                f"\nTimes in your configured window "
+                                f"(hour {_env_int('SLOT_TARGET_HOUR_24', 13)}:00 local "
+                                f"±{_env_int('SLOT_TARGET_WINDOW_MINUTES', 45)} min): {ts}\n"
+                            )
+                    send_email_alert(
+                        subject="CA DMV: appointment slots may be available",
+                        body=(
+                            "The monitor detected possible open slots.\n\n"
+                            f"URL: {url}\n"
+                            f"{extra}\n"
+                            "Page text excerpt (lowercase):\n"
+                            f"{snippet}\n"
+                            f"\nSlot snapshot id: {fp[:16]}...\n"
+                        ),
+                    )
+                    remember_alert_fingerprint(fp)
         except TimeoutException as e:
             LOG.warning("Timeout; restarting browser session. %s", e)
             driver = recover_session(driver_box)

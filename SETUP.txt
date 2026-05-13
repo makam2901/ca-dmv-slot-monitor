@@ -16,6 +16,11 @@ CA DMV appointment slot monitor
    - Optional: SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED and SLOT_TARGET_HOUR_24 /
      SLOT_TARGET_WINDOW_MINUTES to also require times near a chosen local hour.
 
+   - POLL_INTERVAL_SECONDS (default 300 = five minutes between full checks).
+   - Duplicate alerts: the script stores a fingerprint per emailed slot snapshot in
+     .alerted_slot_fingerprints.json (gitignored); same snapshot is not emailed twice.
+     ALERT_SLOT_FINGERPRINT_CAP trims how many old fingerprints are kept.
+
 3) Foreground (run these as separate lines; do not paste comment text into zsh):
 
      source .venv/bin/activate

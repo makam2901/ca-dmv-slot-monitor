@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .last_slot_state
+.alerted_slot_fingerprints.json
 *.log
 .DS_Store

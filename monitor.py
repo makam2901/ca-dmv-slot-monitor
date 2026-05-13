@@ -369,6 +369,96 @@ def time_pattern_suggest_slots(body: str) -> bool:
     return bool(re.search(r"\b\d{1,2}:\d{2}\s*(am|pm)\b", body))
 
 
+_RE_TIME_HM = re.compile(r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b", re.I)
+_RE_TIME_H = re.compile(r"\b(\d{1,2})\s*(am|pm)\b", re.I)
+
+
+def _clock_to_minutes(hour12: int, minute: int, ampm: str) -> int:
+    ap = ampm.lower()
+    h = int(hour12)
+    mi = int(minute)
+    if ap == "am":
+        if h == 12:
+            h = 0
+    else:
+        if h != 12:
+            h += 12
+    return h * 60 + mi
+
+
+def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    (s1, e1), (s2, e2) = a, b
+    return not (e1 <= s2 or s1 >= e2)
+
+
+def parse_times_from_text(text: str) -> set[int]:
+    """Parse 12-hour times in text to minutes since local midnight."""
+    out: set[int] = set()
+    hm_spans: list[tuple[int, int]] = []
+    for m in _RE_TIME_HM.finditer(text):
+        out.add(_clock_to_minutes(int(m.group(1)), int(m.group(2)), m.group(3)))
+        hm_spans.append(m.span())
+    for m in _RE_TIME_H.finditer(text):
+        span = m.span()
+        if any(_spans_overlap(span, o) for o in hm_spans):
+            continue
+        out.add(_clock_to_minutes(int(m.group(1)), 0, m.group(2)))
+    return out
+
+
+def _format_minutes_clock(m: int) -> str:
+    h, mi = divmod(m, 60)
+    ap = "am" if h < 12 else "pm"
+    h12 = h % 12
+    if h12 == 0:
+        h12 = 12
+    return f"{h12}:{mi:02d} {ap}"
+
+
+def page_body_text_raw(driver: webdriver.Chrome) -> str:
+    try:
+        return driver.find_element(By.TAG_NAME, "body").text
+    except StaleElementReferenceException:
+        return ""
+
+
+def gather_text_for_time_parsing(driver: webdriver.Chrome) -> str:
+    parts = [page_body_text_raw(driver)]
+    raw = os.getenv("SLOT_CSS_SELECTORS", "").strip()
+    if raw:
+        for sel in [s.strip() for s in raw.split(",") if s.strip()]:
+            try:
+                for e in driver.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if e.is_displayed():
+                            t = (e.text or "").strip()
+                            if t:
+                                parts.append(t)
+                    except StaleElementReferenceException:
+                        continue
+            except WebDriverException:
+                continue
+    return "\n".join(parts)
+
+
+def collect_slot_times_minutes(driver: webdriver.Chrome) -> set[int]:
+    return parse_times_from_text(gather_text_for_time_parsing(driver))
+
+
+def times_in_target_window(times: set[int]) -> list[int]:
+    if not times:
+        return []
+    hour_24 = _env_int("SLOT_TARGET_HOUR_24", 13)
+    win = _env_int("SLOT_TARGET_WINDOW_MINUTES", 45)
+    center = hour_24 * 60
+    lo, hi = center - win, center + win
+    return sorted(t for t in times if lo <= t <= hi)
+
+
+def slot_times_within_target_window(times: set[int]) -> bool:
+    return bool(times_in_target_window(times))
+
+
 def slots_likely_available(driver: webdriver.Chrome) -> bool:
     body = page_body_text(driver)
     if not body.strip():
@@ -377,11 +467,41 @@ def slots_likely_available(driver: webdriver.Chrome) -> bool:
         return False
     need = _env_int("SLOT_MIN_COUNT", 1)
     n = count_visible_slot_elements(driver)
+    has_css = bool(os.getenv("SLOT_CSS_SELECTORS", "").strip())
+
     if n >= need:
-        return True
-    if os.getenv("SLOT_CSS_SELECTORS", "").strip():
+        base = True
+    elif has_css:
+        base = False
+    else:
+        base = time_pattern_suggest_slots(body)
+
+    if not base:
         return False
-    return time_pattern_suggest_slots(body)
+
+    if not _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
+        return True
+
+    times = collect_slot_times_minutes(driver)
+    if not times:
+        LOG.info(
+            "Local time filter is on but no times could be parsed; not alerting "
+            "(set SLOT_CSS_SELECTORS so slot button text is scanned, or check page copy)."
+        )
+        return False
+    if not slot_times_within_target_window(times):
+        preview = ", ".join(_format_minutes_clock(t) for t in sorted(times)[:24])
+        suffix = " …" if len(times) > 24 else ""
+        LOG.info(
+            "Slots or times on page, but none within target window "
+            "(hour=%s, ±%s min). Parsed: %s%s",
+            _env_int("SLOT_TARGET_HOUR_24", 13),
+            _env_int("SLOT_TARGET_WINDOW_MINUTES", 45),
+            preview,
+            suffix,
+        )
+        return False
+    return True
 
 
 def run_flow(driver: webdriver.Chrome) -> None:
@@ -463,11 +583,22 @@ def main() -> None:
             if available and not within_alert_cooldown():
                 url = driver.current_url
                 snippet = page_body_text(driver)[:4000]
+                extra = ""
+                if _env_bool("SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED", False):
+                    matched = times_in_target_window(collect_slot_times_minutes(driver))
+                    if matched:
+                        ts = ", ".join(_format_minutes_clock(t) for t in matched)
+                        extra = (
+                            f"\nTimes in your configured window "
+                            f"(hour {_env_int('SLOT_TARGET_HOUR_24', 13)}:00 local "
+                            f"±{_env_int('SLOT_TARGET_WINDOW_MINUTES', 45)} min): {ts}\n"
+                        )
                 send_email_alert(
                     subject="CA DMV: appointment slots may be available",
                     body=(
                         "The monitor detected possible open slots.\n\n"
-                        f"URL: {url}\n\n"
+                        f"URL: {url}\n"
+                        f"{extra}\n"
                         "Page text excerpt (lowercase):\n"
                         f"{snippet}\n"
                     ),

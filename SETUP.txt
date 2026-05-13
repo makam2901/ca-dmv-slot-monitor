@@ -9,7 +9,10 @@ CA DMV appointment slot monitor
    - Optional: DMV_ZIP_CODE (e.g. 95051 for Santa Clara Field Office) and
      DMV_OFFICE_CLICK_TEXT (e.g. Santa Clara) so the script can narrow and open that office.
    - Tune SLOT_CSS_SELECTORS after you inspect the time-slot page in Chrome DevTools
-     (comma-separated CSS selectors for visible time buttons). This is the most reliable signal.
+     (comma-separated CSS selectors for visible time buttons). Strongly recommended when
+     using the local-time filter so times are read from slot controls, not unrelated page text.
+   - Optional: SLOT_FILTER_NEAR_HOUR_LOCAL_ENABLED and SLOT_TARGET_HOUR_24 /
+     SLOT_TARGET_WINDOW_MINUTES to alert only near a chosen local time (e.g. 1 PM).
 
 3) Foreground (run these as separate lines; do not paste comment text into zsh):
 
